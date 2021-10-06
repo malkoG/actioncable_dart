@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:collection';
 import 'dart:convert';
 
 import 'package:web_socket_channel/io.dart';
@@ -17,6 +18,8 @@ class ActionCable {
   late Timer _timer;
   late IOWebSocketChannel _socketChannel;
   late StreamSubscription _listener;
+  late String connectionUrl;
+  late Map<String, String> connectionHeaders;
   _OnConnectedFunction? onConnected;
   _OnCannotConnectFunction? onCannotConnect;
   _OnConnectionLostFunction? onConnectionLost;
@@ -25,27 +28,60 @@ class ActionCable {
       {};
   Map<String, _OnChannelMessageFunction?> _onChannelMessageCallbacks = {};
 
+  bool retryUnlimited;
+  SplayTreeSet<String> subscriptions = SplayTreeSet<String>();
+
   ActionCable.Connect(
     String url, {
     Map<String, String> headers: const {},
     this.onConnected,
     this.onConnectionLost,
     this.onCannotConnect,
+    this.retryUnlimited = false,
   }) {
-    // rails gets a ping every 3 seconds
-    _socketChannel = IOWebSocketChannel.connect(url,
-        headers: headers, pingInterval: Duration(seconds: 3));
-    _listener = _socketChannel.stream.listen(_onData, onError: (_) {
-      this.disconnect(); // close a socket and the timer
-      if (this.onCannotConnect != null) this.onCannotConnect!();
-    });
-    _timer = Timer.periodic(const Duration(seconds: 3), healthCheck);
+    this.connectionUrl = url;
+    this.connectionHeaders = headers;
+
+    this._setupConnection();
   }
 
   void disconnect() {
+    this.subscriptions.clear();
+
     _timer.cancel();
     _socketChannel.sink.close();
     _listener.cancel();
+  }
+
+  void _setupConnection() {
+    try {
+      // rails gets a ping every 3 seconds
+      _socketChannel = IOWebSocketChannel.connect(this.connectionUrl,
+          headers: this.connectionHeaders, pingInterval: Duration(seconds: 3));
+      _listener = _socketChannel.stream.listen(_onData, onError: (_) {
+        if (!this.retryUnlimited)
+          this.disconnect(); // close a socket and the timer
+        else {}
+        if (this.onCannotConnect != null) this.onCannotConnect!();
+      });
+    } catch (error) {
+      print("=== Connection Refused! ===");
+      print(error);
+    }
+
+    _timer = Timer.periodic(const Duration(seconds: 3), healthCheck);
+  }
+
+  void _reconnect() {
+    try {
+      this._setupConnection();
+
+      for (var channelId in subscriptions) {
+        _send({'identifier': channelId, 'command': 'subscribe'});
+      }
+    } catch (error) {
+      print(error);
+    }
   }
 
   // check if there is no ping for 3 seconds and signal a [onConnectionLost] if
@@ -55,7 +91,12 @@ class ActionCable {
       return;
     }
     if (DateTime.now().difference(_lastPing!) > Duration(seconds: 6)) {
-      this.disconnect();
+      if (retryUnlimited) {
+        _timer.cancel();
+        this._reconnect();
+      } else {
+        this.disconnect();
+      }
       if (this.onConnectionLost != null) this.onConnectionLost!();
     }
   }
@@ -73,6 +114,8 @@ class ActionCable {
     _onChannelDisconnectedCallbacks[channelId] = onDisconnected;
     _onChannelMessageCallbacks[channelId] = onMessage;
 
+    if (retryUnlimited) subscriptions.add(channelId);
+
     _send({'identifier': channelId, 'command': 'subscribe'});
   }
 
@@ -82,6 +125,8 @@ class ActionCable {
     _onChannelSubscribedCallbacks[channelId] = null;
     _onChannelDisconnectedCallbacks[channelId] = null;
     _onChannelMessageCallbacks[channelId] = null;
+
+    if (retryUnlimited) subscriptions.remove(channelId);
 
     _socketChannel.sink
         .add(jsonEncode({'identifier': channelId, 'command': 'unsubscribe'}));
