@@ -156,6 +156,10 @@ class ActionCable {
     }
   }
 
+  IOWebSocketChannel getChannelInfo() {
+    return _socketChannel;
+  }
+
   void _handleProtocolMessage(Map payload) {
     switch (payload['type']) {
       case 'ping':
